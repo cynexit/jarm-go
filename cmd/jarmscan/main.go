@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bufio"
+	"encoding/csv"
 	"flag"
 	"fmt"
 	"net"
@@ -23,6 +25,8 @@ var Version = "dev"
 var defaultPorts = flag.String("p", "443", "default ports")
 var workerCount = flag.Int("w", 256, "worker count")
 var quietMode = flag.Bool("q", false, "quiet mode")
+var outputFile = flag.String("o", "", "output to a csv file")
+var inputFile = flag.String("i", "", "read targets from file")
 
 // ValidPort determines if a port number is valid
 func ValidPort(pnum int) bool {
@@ -139,6 +143,88 @@ func Fingerprint(t target, och chan result) {
 	}
 }
 
+func processTarget(s string, tch chan target, defaultPorts []int) {
+	t := target{}
+
+	// Try parsing as a URL first
+	if u, err := url.Parse(s); err == nil {
+		t.Host = u.Hostname()
+		port, _ := strconv.Atoi(u.Port())
+		t.Port = port
+	}
+
+	// Next try parsing as an address:port pair
+	if t.Host == "" {
+		host, portStr, _ := net.SplitHostPort(s)
+		port, _ := strconv.Atoi(portStr)
+		t.Host = host
+		t.Port = port
+	}
+
+	// Next try parsing as a host,port pair
+	if t.Host == "" {
+		bits := strings.SplitN(s, ",", 2)
+		if len(bits) == 2 && bits[0] != "" {
+			t.Host = bits[0]
+			port, _ := strconv.Atoi(bits[1])
+			t.Port = port
+
+		}
+	}
+
+	// Finally try parsing as a host:port pair
+	if t.Host == "" {
+		bits := strings.SplitN(s, ":", 2)
+		if bits[0] != "" {
+			t.Host = bits[0]
+		}
+		if len(bits) == 2 && bits[0] != "" {
+			port, _ := strconv.Atoi(bits[1])
+			t.Port = port
+		}
+	}
+
+	hosts := []string{t.Host}
+
+	for _, host := range hosts {
+
+		// Support CIDR networks as targets
+		hch := make(chan string, 1)
+		qch := make(chan int, 1)
+		hwg := sync.WaitGroup{}
+		hwg.Add(1)
+
+		go func() {
+			defer hwg.Done()
+			for thost := range hch {
+				ports := defaultPorts
+				if t.Port != 0 {
+					ports = []int{t.Port}
+				}
+				for _, port := range ports {
+					tch <- target{
+						Host: thost,
+						Port: port,
+					}
+				}
+			}
+		}()
+
+		// Try to iterate the host as a CIDR range
+		herr := rnd.AddressesFromCIDR(host, hch, qch)
+
+		// Not a parseable range, handle it as a bare host instead
+		if herr != nil {
+			hch <- host
+		}
+
+		// Wrap up and wait
+		close(hch)
+		hwg.Wait()
+		close(qch)
+	}
+}
+
 type target struct {
 	Host string
 	Port int
@@ -166,6 +252,23 @@ func main() {
 		log.SetOutput(dn)
 	}
 
+	if *outputFile != "" {
+		// Check output file before doing processing
+		outputFileHandle, err := os.Create(*outputFile)
+		if err != nil {
+			log.Fatalf("couldn't create output file: %s", err)
+		}
+		outputFileHandle.Close()
+	}
+
+	if *inputFile != "" {
+		// Check input file before doing processing
+		_, err := os.Stat(*inputFile)
+		if os.IsNotExist(err) {
+			log.Fatalf("can't find input file: %s", err)
+		}
+	}
+
 	defaultPorts, err := CrackPortsWithDefaults(*defaultPorts, []uint16{})
 	if err != nil {
 		log.Fatalf("invalid ports: %s", err)
@@ -191,9 +294,31 @@ func main() {
 	wgo.Add(1)
 	go func() {
 		defer wgo.Done()
+
+		outputFileSet := false
+		var outputFileWriter *csv.Writer
+		if *outputFile != "" {
+			outputFileHandle, err := os.OpenFile(*outputFile, os.O_APPEND|os.O_WRONLY, os.ModeAppend)
+			if err != nil {
+				log.Fatalf("couldn't open output file: %s", err)
+			}
+
+			outputFileWriter = csv.NewWriter(outputFileHandle)
+			outputFileSet = true
+			outputFileWriter.Write([]string{"Host", "Port", "Failed", "Output"})
+
+			defer outputFileWriter.Flush()
+			defer outputFileHandle.Close()
+		}
+
 		for o := range och {
 			if o.Error != nil {
 				log.Printf("failed to scan %s:%d: %s", o.Target.Host, o.Target.Port, o.Error)
+
+				if outputFileSet {
+					outputFileWriter.Write([]string{o.Target.Host, strconv.Itoa(o.Target.Port), "true", o.Error.Error()})
+				}
+
 				continue
 			}
 			if len(o.Target.Host) > 24 {
@@ -202,90 +327,27 @@ func main() {
 				fmt.Printf("JARM\t%24s:%d\t%s\n", o.Target.Host, o.Target.Port, o.Hash)
 			}
 
+			if outputFileSet {
+				outputFileWriter.Write([]string{o.Target.Host, strconv.Itoa(o.Target.Port), "false", o.Hash})
+			}
 		}
 	}()
 
 	// Process targets
 	for _, s := range flag.Args() {
+		processTarget(s, tch, defaultPorts)
+	}
 
-		t := target{}
-
-		// Try parsing as a URL first
-		if u, err := url.Parse(s); err == nil {
-			t.Host = u.Hostname()
-			port, _ := strconv.Atoi(u.Port())
-			t.Port = port
+	if *inputFile != "" {
+		inputFileHandle, err := os.Open(*inputFile)
+		if err != nil {
+			log.Fatalf("can't find input file: %s", err)
 		}
+		defer inputFileHandle.Close()
 
-		// Next try parsing as an address:port pair
-		if t.Host == "" {
-			host, portStr, _ := net.SplitHostPort(s)
-			port, _ := strconv.Atoi(portStr)
-			t.Host = host
-			t.Port = port
-		}
-
-		// Next try parsing as a host,port pair
-		if t.Host == "" {
-			bits := strings.SplitN(s, ",", 2)
-			if len(bits) == 2 && bits[0] != "" {
-				t.Host = bits[0]
-				port, _ := strconv.Atoi(bits[1])
-				t.Port = port
-
-			}
-		}
-
-		// Finally try parsing as a host:port pair
-		if t.Host == "" {
-			bits := strings.SplitN(s, ":", 2)
-			if bits[0] != "" {
-				t.Host = bits[0]
-			}
-			if len(bits) == 2 && bits[0] != "" {
-				port, _ := strconv.Atoi(bits[1])
-				t.Port = port
-			}
-		}
-
-		hosts := []string{t.Host}
-
-		for _, host := range hosts {
-
-			// Support CIDR networks as targets
-			hch := make(chan string, 1)
-			qch := make(chan int, 1)
-			hwg := sync.WaitGroup{}
-			hwg.Add(1)
-
-			go func() {
-				defer hwg.Done()
-				for thost := range hch {
-					ports := defaultPorts
-					if t.Port != 0 {
-						ports = []int{t.Port}
-					}
-					for _, port := range ports {
-						tch <- target{
-							Host: thost,
-							Port: port,
-						}
-					}
-				}
-			}()
-
-			// Try to iterate the host as a CIDR range
-			herr := rnd.AddressesFromCIDR(host, hch, qch)
-
-			// Not a parseable range, handle it as a bare host instead
-			if herr != nil {
-				hch <- host
-			}
-
-			// Wrap up and wait
-			close(hch)
-			hwg.Wait()
-			close(qch)
+		inputScanner := bufio.NewScanner(inputFileHandle)
+		for inputScanner.Scan() {
+			processTarget(inputScanner.Text(), tch, defaultPorts)
 		}
 	}
 

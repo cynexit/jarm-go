@@ -14,10 +14,15 @@ To run a scan, provide a list of targets. The following examples are all support
 * `jarmscan -p 443,465,993,995,8443,9443 192.168.0.0/24`
 * `jarmscan 192.168.0.1:8443`
 * `jarmscan 192.168.0.1,443`
+* `jarmscan -i targets.txt -o results.csv`
 
 The `-q` option can be used to disable verbose output and the `-w` parameter can be used to increase the worker count.
 
 The `-p` option allows port lists and port ranges to be specified in a form similar to Nmap.
+
+The `-i` option allows to specify an input file that contains one target per line.
+
+The `-o` option allows to specify an output csv file all the results will be written to.
 
 # jarm
 
